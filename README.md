@@ -1,6 +1,6 @@
 # ProFunc3D
 
-Official implementation of **ProFunc3D: Bridging 2D Grounding and 3D Proposals for 3D Functionality Grounding**.
+Official implementation of **ProFunc3D: Proposal-Grounded And Instance-Aware 3D Functionality Grounding**.
 
 ProFunc3D predicts a functional 3D region from a natural-language instruction, an RGB-D scanning video, and its registered point cloud. It contains the two components named in the paper:
 
@@ -15,30 +15,6 @@ On the SceneFun3D Task-2 validation set, the released configuration obtains:
 
 The machine-readable reference values are provided in
 [`assets/expected_metrics.json`](assets/expected_metrics.json).
-
-## Method
-
-Given instruction `q`, scanning video `V`, and point cloud `P`, a frozen vision-language model predicts a sparse point `p_t` in each of at most 50 retrieved frames. A language-agnostic proposal bank contains coherent 3D regions `Π={π_i}`.
-
-### Proposal-grounded Association (PGA)
-
-For each grounding point, PGA projects the visible points of every proposal into the source frame, measures the image-space point-to-proposal distance, and assigns the observation to one proposal. Local surface support within `r_s=20 px` resolves overlapping proposals. The resulting assignments are aggregated into generic evidence `V_i^g`; non-relational instructions select the proposal with maximum generic evidence.
-
-The released checkpoint uses a deterministic overlap condition: local surface support resolves proposals whose nearest projected distances are numerically tied.
-
-### Instance-aware Reweighting (IAR)
-
-For a relational instruction, LLaMA-3.1 decomposes the instruction into a parent object, relation, and reference object. OWLv2+RobustSAM parent observations are lifted to 3D and clustered with DBSCAN (`0.75 m`) into persistent physical-instance tracks. The track most consistent with the relation is selected.
-
-The selected track is aligned with the original grounding frames within `±0.9 s`; no extra Molmo frames are introduced. For aligned frame `t`,
-
-```text
-q_t = detection_confidence_t × frame_completeness_t
-q_bar_t = q_t / max(q)
-w_t = sigmoid((q_bar_t - beta) / gamma)
-```
-
-with `beta=0.20` and `gamma=0.02`. Unaligned observations receive zero weight. If no grounding observation aligns with the selected track, ProFunc3D falls back to unweighted PGA, as described in the paper.
 
 ## Repository layout
 
@@ -204,10 +180,5 @@ Fresh inference must use `configs/profunc3d.yaml` and the current `selected_trac
 ```bash
 pytest -q
 python -m py_compile profunc3d/*.py scripts/*.py
-```
+``
 
-The prediction path does not read SceneFun3D annotations, ground-truth masks, oracle proposals, or IoU values.
-
-## 中文说明
-
-这是论文方法的独立开源目录，与原实验工程平行。公开模块名严格对应论文中的 **PGA** 和 **IAR**。完整入口接收带标定的 RGB-D 扫描、点云和自然语言指令，最终输出与输入点云逐点对齐的二值预测区域。默认配置不增加 Molmo 帧：IAR 只给原始至多 50 帧的 grounding evidence 重新赋权。
