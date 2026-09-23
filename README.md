@@ -180,5 +180,5 @@ Fresh inference must use `configs/profunc3d.yaml` and the current `selected_trac
 ```bash
 pytest -q
 python -m py_compile profunc3d/*.py scripts/*.py
-``
+```
 
