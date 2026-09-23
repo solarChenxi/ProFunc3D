@@ -1,0 +1,41 @@
+# Exact replay of the frozen SceneFun3D validation checkpoint.
+python: python
+mask3d_python: /path/to/mask3d/environment/bin/python
+fun3du_root: third_party/Fun3DU
+dataset_root: data/scenefun3d
+split: val
+device: cuda:0
+visits: []
+visit_indices: null
+
+work_dir: outputs/paper_replay
+grounding_observations: assets/paper_checkpoint/grounding_observations
+contracts: assets/paper_checkpoint/contracts.json
+pga_output: outputs/paper_replay/pga_associations.json
+track_dir: assets/paper_checkpoint/instance_timelines
+frozen_track_dir: assets/paper_checkpoint/selected_instances
+prediction_dir: outputs/paper_replay/predictions
+
+object_masks: owl2_rsam_v2
+proposal_bank: assets/paper_checkpoint/proposal_bank
+mask3d_checkpoint: /path/to/mask3d_f_checkpoint.ckpt
+parent_overrides: assets/paper_checkpoint/parent_retrieval_overrides.json
+
+pga:
+  max_point_distance_px: 100.0
+  surface_radius_px: 20.0
+  generic_support_ratio: 1.30
+  relational_support_ratio: 1.10
+
+iar:
+  dbscan_radius_m: 0.75
+  temporal_alignment_s: 0.90
+  context_window_s: 12.0
+  timeline_sampling_s: 1.5
+  point_stride: 35
+  minimum_lifted_points: 8
+  beta: 0.20
+  gamma: 0.02
+
+write_ply: false
+visualization_points: 300000

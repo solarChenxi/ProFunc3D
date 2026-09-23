@@ -1,0 +1,29 @@
+# Strict proposal-bank substitution used for the proposal-quality analysis.
+# All PGA/IAR inputs and hyperparameters are frozen to the paper checkpoint;
+# only `proposal_bank` differs from the released Mask3D-F configuration.
+fun3du_root: ../decoupled_grounding
+dataset_root: ../data/scenefun3d
+split: val
+device: cpu
+
+work_dir: ../decoupled_grounding/exps/prototype_bank/val_task1_gt_bank/pga_iar_fixed_selector
+grounding_observations: ../decoupled_grounding/exps/reproduce_v2/frames
+contracts: ../decoupled_grounding/exps/task_router/structured_contracts_val445.json
+pga_output: ../decoupled_grounding/exps/prototype_bank/val_task1_gt_bank/pga_iar_fixed_selector/pga_associations.json
+track_dir: ../decoupled_grounding/exps/task_router/weighted_vote_track_parent_timeline_cases
+frozen_track_dir: ../decoupled_grounding/exps/task_router/parent_instance_track_all309_cases
+prediction_dir: ../decoupled_grounding/exps/prototype_bank/val_task1_gt_bank/pga_iar_fixed_selector/predictions
+proposal_bank: ../decoupled_grounding/exps/prototype_bank/val_task1_gt_bank
+
+pga:
+  max_point_distance_px: 100.0
+  surface_radius_px: 20.0
+  generic_support_ratio: 1.30
+  relational_support_ratio: 1.10
+
+iar:
+  temporal_alignment_s: 0.90
+  beta: 0.20
+  gamma: 0.02
+
+write_ply: false

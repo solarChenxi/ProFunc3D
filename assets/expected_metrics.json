@@ -1,0 +1,16 @@
+{
+  "dataset": "SceneFun3D Task-2 validation",
+  "number_of_queries": 445,
+  "configuration": "ProFunc3D (PGA + IAR)",
+  "metrics_percent": {
+    "mAP": 23.124,
+    "AP50": 31.910,
+    "AP25": 43.146,
+    "mAR": 28.607,
+    "AR50": 36.180,
+    "AR25": 44.045,
+    "mIoU": 25.182
+  },
+  "relational_queries": 309,
+  "relational_mIoU_percent": 23.205
+}

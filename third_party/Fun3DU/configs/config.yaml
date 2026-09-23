@@ -1,0 +1,60 @@
+exp_root : exps   # path to the folder with experiments
+exp_name : debug  # experiment name, folder in exp_root/
+device : cuda
+debug_viz: False
+
+dataset:
+  # Overridden by ProFunc3D/configs/*.yaml during normal use.
+  root : data/scenefun3d # root to scenefun3d dataset
+  split: val  # val or train
+  start:  # optional values, to set start and end of the visit splits.
+  end:
+  # optional non-contiguous shard, e.g. [0,2,25]; if set, overrides start/end
+  visit_indices:
+
+frame_folder: frames # name of the frame folder inside the exp folder, where data about molmo masks is stored
+pcds_folder: pcds    # name of the pcd folder inside the exp folder, where data about final 3D masks is stored
+llm_type: llama_hyp  # llama | llama_v2 | llama_hyp ...
+# llm_mode: hyp  (optional; also inferred from llm_type ending with _hyp)
+llm_mode:
+hyp_k: 3               # K open hypotheses
+hyp_visual: true       # use OWL mask index to verify/rank hypotheses when available
+mask_type: owl2_rsam # also used as visual-verify evidence source ({visit}_{mask_type}_masks.json)
+
+frame_sampling:
+  mode: score_mean   # samples frames according to the score
+  n: 50              # number of frames to sample
+
+molmo_prompt: original # default, synonims. Only influences molmo
+
+# Qwen-VL frontend (run_qwen_cot.py stage 1, run_qwen_point.py stage 3)
+qwen_model_id: Qwen/Qwen3-VL-8B-Instruct
+qwen_max_side: 768    # longest image side fed to Qwen; coords scaled back to full res
+qwen_max_points: 0    # cap points per frame before SAM; 0 = keep all
+threshold: 0.7         # used in evaluation
+detection_bs: 4       # OWL+RobustSAM batch size; keep 1 on 32GB V100
+video_id:             # optional: only this video within selected visits
+frame_start:          # optional: frame index shard [frame_start, frame_end)
+frame_end:
+# optional: only these description indices within each visit (molmo); overrides desc_start/end
+desc_indices:
+desc_start:           # optional contiguous desc shard [desc_start, desc_end)
+desc_end:
+
+# GeoPurify-style lift postprocess (scripts/geopurify_pcd_postprocess.py)
+in_pcds: pcds
+out_pcds: pcds_geo
+geo_feat_source: geom   # geom (normals+XYZ) | sonata (frozen Sonata teacher)
+geo_K: 48
+geo_T: 12
+geo_alpha: 3.0        # with zscore: 2~5 sharp; with raw: need ~100+
+geo_aff_mode: zscore  # zscore (recommended) | raw
+geo_lam: 0.65
+geo_lam_mode: const   # const | var
+geo_expand_k: 16
+geo_expand_r: 1
+geo_support_thr: 1.0e-6
+geo_chunk: 8192       # affinity chunk size (Sonata high-dim OOM guard)
+geo_use_normals: true
+geo_normal_knn: 16
+overwrite: false

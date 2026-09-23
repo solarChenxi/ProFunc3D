@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use ProFunc3D, please cite our paper."
+title: "ProFunc3D: Bridging 2D Grounding and 3D Proposals for 3D Functionality Grounding"
+type: software
+authors:
+  - family-names: Dai
+    given-names: Chenxi
+  - family-names: Yu
+    given-names: Hengfu
+  - family-names: Li
+    given-names: Wen
+version: 0.1.0
+date-released: 2026-09-19
+

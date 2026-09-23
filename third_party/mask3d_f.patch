@@ -1,0 +1,1761 @@
+diff --git a/benchmark/evaluate_semantic_instance.py b/benchmark/evaluate_semantic_instance.py
+index 242cb87..adbc992 100644
+--- a/benchmark/evaluate_semantic_instance.py
++++ b/benchmark/evaluate_semantic_instance.py
+@@ -501,6 +501,28 @@ def evaluate(
+             LABEL_TO_ID[CLASS_LABELS[i]] = VALID_CLASS_IDS[i]
+             ID_TO_LABEL[VALID_CLASS_IDS[i]] = CLASS_LABELS[i]
+ 
++    if dataset == "scenefun3d":
++        # SceneFun3D Task-1: 9 affordance classes (ids 1..9 in instance_gt =
++        # semantic*1000 + instance + 1). Not ScanNet furniture classes.
++        opt["min_region_sizes"] = np.array([10])  # functional parts are tiny
++        CLASS_LABELS = [
++            "rotate",
++            "key_press",
++            "tip_push",
++            "hook_turn",
++            "pinch_pull",
++            "hook_pull",
++            "plug_in",
++            "unplug",
++            "foot_push",
++        ]
++        VALID_CLASS_IDS = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9])
++        ID_TO_LABEL = {}
++        LABEL_TO_ID = {}
++        for i in range(len(VALID_CLASS_IDS)):
++            LABEL_TO_ID[CLASS_LABELS[i]] = VALID_CLASS_IDS[i]
++            ID_TO_LABEL[VALID_CLASS_IDS[i]] = CLASS_LABELS[i]
++
+     if dataset == "s3dis":
+         # global CLASS_LABELS
+         # global VALID_CLASS_IDS
+diff --git a/conf/config_base_instance_segmentation.yaml b/conf/config_base_instance_segmentation.yaml
+index 61aeae0..f8a0667 100644
+--- a/conf/config_base_instance_segmentation.yaml
++++ b/conf/config_base_instance_segmentation.yaml
+@@ -32,6 +32,9 @@ general:
+ 
+   scores_threshold: 0.0
+   iou_threshold: 1.0
++  # Binary mask from logits: (logit > mask_logit_threshold). Default 0 ≡ sigmoid>0.5.
++  # Raise (e.g. 5–8) to shrink oversized SceneFun3D part predictions at eval.
++  mask_logit_threshold: 0.0
+ 
+   area: 5
+ 
+diff --git a/datasets/random_cuboid.py b/datasets/random_cuboid.py
+index 334b87e..e46ed97 100644
+--- a/datasets/random_cuboid.py
++++ b/datasets/random_cuboid.py
+@@ -91,6 +91,21 @@ class RandomCuboid(object):
+ 
+             return new_pointidx
+ 
+-        # fallback
++        # fallback: never return the full multi-million laser scan (hangs curriculum /
++        # OOM on V100). Take a hard axis-aligned crop around a random point.
+         print("FALLBACK")
+-        return np.ones(point_cloud.shape[0], dtype=np.bool)
++        n = point_cloud.shape[0]
++        center = point_cloud[np.random.randint(0, n), :2]
++        min_xy = center - self.crop_length / 2
++        max_xy = center + self.crop_length / 2
++        keep = (
++            (point_cloud[:, 0] >= min_xy[0])
++            & (point_cloud[:, 0] <= max_xy[0])
++            & (point_cloud[:, 1] >= min_xy[1])
++            & (point_cloud[:, 1] <= max_xy[1])
++        )
++        if np.sum(keep) < max(1000, self.min_points // 10):
++            # last resort: random subset
++            keep = np.zeros(n, dtype=np.bool)
++            keep[np.random.choice(n, size=min(n, max(self.min_points, 200000)), replace=False)] = True
++        return keep
+diff --git a/datasets/semseg.py b/datasets/semseg.py
+index 4a295b7..ef7eb3e 100644
+--- a/datasets/semseg.py
++++ b/datasets/semseg.py
+@@ -28,6 +28,71 @@ from datasets.scannet200.scannet200_constants import (
+ logger = logging.getLogger(__name__)
+ 
+ 
++def curriculum_mask_radius(
++    epoch: int, r0: float = 0.1, decay: float = 0.5, alpha: int = 200
++) -> float:
++    """Mask3D-F appendix: r(e) = r0 * decay^(floor(e/alpha))."""
++    if epoch < 0:
++        return 0.0
++    return float(r0 * (decay ** (epoch // alpha)))
++
++
++def expand_instance_masks_ball(
++    coordinates: np.ndarray,
++    labels: np.ndarray,
++    radius: float,
++    ignore_label: int = 255,
++    max_points: int = 600000,
++) -> np.ndarray:
++    """Dilate GT instance masks in xyz; only fill ignore/unlabeled points.
++
++    Optimized for SceneFun3D laser scans: query only unlabeled points, and
++    skip expansion on oversized clouds (crop fallback) to avoid DDP stalls.
++    """
++    if radius <= 0 or labels.shape[0] == 0:
++        return labels
++    if coordinates.shape[0] > max_points:
++        # Prefer keeping training alive over perfect curriculum on huge clouds.
++        return labels
++    labels = labels.copy()
++    sem = labels[:, 0]
++    inst = labels[:, 1]
++    positive = inst > 0
++    if not np.any(positive):
++        return labels
++    unlabeled = (sem == ignore_label) | (inst <= 0)
++    if not np.any(unlabeled):
++        return labels
++    unlabeled_idx = np.flatnonzero(unlabeled)
++    unlabeled_coords = coordinates[unlabeled_idx]
++    for iid in np.unique(inst[positive]):
++        seed_mask = inst == iid
++        seed_coords = coordinates[seed_mask]
++        if seed_coords.shape[0] == 0:
++            continue
++        sem_val = int(sem[seed_mask][0])
++        tree = scipy.spatial.cKDTree(seed_coords)
++        dists, _ = tree.query(
++            unlabeled_coords, k=1, distance_upper_bound=radius, workers=-1
++        )
++        near_local = np.isfinite(dists)
++        if not np.any(near_local):
++            continue
++        assign_idx = unlabeled_idx[near_local]
++        # Do not overwrite other instances (unlabeled_idx already excludes them).
++        sem[assign_idx] = sem_val
++        inst[assign_idx] = iid
++        # Refresh unlabeled set cheaply for subsequent instances.
++        still = (sem[unlabeled_idx] == ignore_label) | (inst[unlabeled_idx] <= 0)
++        unlabeled_idx = unlabeled_idx[still]
++        unlabeled_coords = coordinates[unlabeled_idx]
++        if unlabeled_idx.size == 0:
++            break
++    labels[:, 0] = sem
++    labels[:, 1] = inst
++    return labels
++
++
+ class SemanticSegmentationDataset(Dataset):
+     """Docstring for SemanticSegmentationDataset."""
+ 
+@@ -78,6 +143,14 @@ class SemanticSegmentationDataset(Dataset):
+         add_clip=False,
+         is_elastic_distortion=True,
+         color_drop=0.0,
++        curriculum_mask_expand=False,
++        curriculum_r0=0.1,
++        curriculum_decay=0.5,
++        curriculum_alpha=200,
++        instance_crop_prob=0.5,
++        database_basename: Optional[str] = None,
++        sliding_window=False,
++        crop_stride=2.0,
+     ):
+         assert task in [
+             "instance_segmentation",
+@@ -88,6 +161,15 @@ class SemanticSegmentationDataset(Dataset):
+         self.dataset_name = dataset_name
+         self.is_elastic_distortion = is_elastic_distortion
+         self.color_drop = color_drop
++        self.curriculum_mask_expand = curriculum_mask_expand
++        self.curriculum_r0 = curriculum_r0
++        self.curriculum_decay = curriculum_decay
++        self.curriculum_alpha = curriculum_alpha
++        self.instance_crop_prob = float(instance_crop_prob)
++        self.sliding_window = bool(sliding_window)
++        self.crop_stride = float(crop_stride)
++        self.current_epoch = 0
++        self.database_basename = database_basename
+ 
+         if self.dataset_name == "scannet":
+             self.color_map = SCANNET_COLOR_MAP_20
+@@ -112,6 +194,8 @@ class SemanticSegmentationDataset(Dataset):
+             }  # Fence
+         elif self.dataset_name == "scannet200":
+             self.color_map = SCANNET_COLOR_MAP_200
++        elif self.dataset_name == "scenefun3d":
++            self.color_map = {255: (255, 255, 255)}
+         elif self.dataset_name == "s3dis":
+             self.color_map = {
+                 0: [0, 255, 0],  # ceiling
+@@ -184,14 +268,14 @@ class SemanticSegmentationDataset(Dataset):
+         for database_path in self.data_dir:
+             database_path = Path(database_path)
+             if self.dataset_name != "s3dis":
+-                if not (database_path / f"{mode}_database.yaml").exists():
+-                    print(
+-                        f"generate {database_path}/{mode}_database.yaml first"
+-                    )
++                if self.database_basename is not None:
++                    db_file = self.database_basename
++                else:
++                    db_file = f"{mode}_database.yaml"
++                if not (database_path / db_file).exists():
++                    print(f"generate {database_path}/{db_file} first")
+                     exit()
+-                self._data.extend(
+-                    self._load_yaml(database_path / f"{mode}_database.yaml")
+-                )
++                self._data.extend(self._load_yaml(database_path / db_file))
+             else:
+                 mode_s3dis = f"Area_{self.area}"
+                 if self.mode == "train":
+@@ -217,6 +301,12 @@ class SemanticSegmentationDataset(Dataset):
+         # if working only on classes for validation - discard others
+         self._labels = self._select_correct_labels(labels, num_labels)
+ 
++        if self.dataset_name == "scenefun3d":
++            for k, v in self._labels.items():
++                cid = int(k)
++                self.color_map[cid] = tuple(v["color"])
++            self.color_map[255] = (255, 255, 255)
++
+         if instance_oversampling > 0:
+             self.instance_data = self._load_yaml(
+                 Path(label_db_filepath).parent / "instance_database.yaml"
+@@ -331,6 +421,36 @@ class SemanticSegmentationDataset(Dataset):
+                 # new_data.append(np.load(self.data[i]["filepath"].replace("../../", "")))
+             # self._data = new_data
+ 
++        if (
++            self.sliding_window
++            and self.dataset_name == "scenefun3d"
++            and "train" not in str(self.mode)
++        ):
++            self._load_sliding_window_index()
++
++    def _load_sliding_window_index(self):
++        """Replace full-scene val items with precomputed 4m sliding crops.
++
++        Expects ``sliding_crops_{mode}.yaml`` under data_dir (see
++        third_party/Fun3DU/scripts/bank/mask3d_f/build_sliding_val_crops.py).
++        """
++        data_root = Path(self.data_dir[0])
++        cache = data_root / f"sliding_crops_{self.mode}.yaml"
++        if not cache.exists():
++            raise FileNotFoundError(
++                f"sliding_window=True but missing {cache}. "
++                "Run build_sliding_val_crops.py first."
++            )
++        crops = self._load_yaml(cache)
++        if not crops:
++            raise RuntimeError(f"empty sliding crop index: {cache}")
++        self._data = crops
++        logger.info(
++            "scenefun3d sliding_window: loaded %d crops from %s",
++            len(self._data),
++            cache,
++        )
++
+     def splitPointCloud(self, cloud, size=50.0, stride=50, inner_core=-1):
+         if inner_core == -1:
+             limitMax = np.amax(cloud[:, 0:3], axis=0)
+@@ -409,6 +529,25 @@ class SemanticSegmentationDataset(Dataset):
+             assert not self.on_crops, "you need caching if on crops"
+             points = np.load(self.data[idx]["filepath"].replace("../../", ""))
+ 
++        # Fixed sliding-window / cropped validation (precomputed crop_xyxy).
++        crop_xyxy = self.data[idx].get("crop_xyxy")
++        if crop_xyxy is not None:
++            x0, y0, x1, y1 = crop_xyxy
++            chosen = (
++                (points[:, 0] >= x0)
++                & (points[:, 0] < x1)
++                & (points[:, 1] >= y0)
++                & (points[:, 1] < y1)
++            )
++            keep_path = self.data[idx].get("keep_indices_filepath")
++            if keep_path:
++                # Absolute scene indices; must match precomputed GT row order.
++                points = np.load(
++                    self.data[idx]["filepath"].replace("../../", "")
++                )[np.load(keep_path)]
++            else:
++                points = points[chosen]
++
+         if "train" in self.mode and self.dataset_name in ["s3dis", "stpls3d"]:
+             inds = self.random_cuboid(points)
+             points = points[inds]
+@@ -421,6 +560,98 @@ class SemanticSegmentationDataset(Dataset):
+             points[:, 10:12],
+         )
+ 
++        # Crop BEFORE curriculum expand. SceneFun3D laser scans are multi-million
++        # points; expanding then cropping OOMs/timeouts DataLoader workers.
++        #
++        # Mix instance-centered (stable DDP / always has GT) with random cuboid
++        # (teaches full-scene context). Pure instance-centered → val AP≈0 because
++        # queries never learn to find parts in a whole laser scan.
++        if ("train" in self.mode or self.is_tta) and self.cropping:
++            half = float(getattr(self.random_cuboid, "crop_length", 4.0)) / 2.0
++            pos = np.flatnonzero(labels[:, 1] > 0)
++            use_instance_center = pos.size > 0 and (
++                np.random.rand() < self.instance_crop_prob
++            )
++
++            def _instance_centered_crop():
++                iids = np.unique(labels[pos, 1])
++                iid = np.random.choice(iids)
++                seed = labels[:, 1] == iid
++                cxy = coordinates[seed, :2].mean(axis=0)
++                jitter = np.random.uniform(-half * 0.25, half * 0.25, size=2)
++                cxy = cxy + jitter
++                chosen = (
++                    (coordinates[:, 0] >= cxy[0] - half)
++                    & (coordinates[:, 0] <= cxy[0] + half)
++                    & (coordinates[:, 1] >= cxy[1] - half)
++                    & (coordinates[:, 1] <= cxy[1] + half)
++                ) | seed
++                if int(chosen.sum()) < 1000:
++                    for scale in (1.5, 2.0, 3.0, 5.0):
++                        chosen = (
++                            (coordinates[:, 0] >= cxy[0] - half * scale)
++                            & (coordinates[:, 0] <= cxy[0] + half * scale)
++                            & (coordinates[:, 1] >= cxy[1] - half * scale)
++                            & (coordinates[:, 1] <= cxy[1] + half * scale)
++                        ) | seed
++                        if int(chosen.sum()) >= 1000:
++                            break
++                return chosen
++
++            if use_instance_center:
++                chosen = _instance_centered_crop()
++            else:
++                chosen = self.random_cuboid(coordinates)
++                # Empty crop → DDP-unsafe; fall back to instance-centered.
++                if pos.size > 0 and int((labels[chosen, 1] > 0).sum()) == 0:
++                    chosen = _instance_centered_crop()
++
++            new_idx = chosen
++            coordinates = coordinates[new_idx]
++            color = color[new_idx]
++            labels = labels[new_idx]
++            segments = segments[new_idx]
++            normals = normals[new_idx]
++            points = points[new_idx]
++            # Hard cap: dense laser crops can still be millions of points and
++            # freeze Minkowski/DDP for minutes per step.
++            max_crop_points = 150000
++            if coordinates.shape[0] > max_crop_points:
++                # Keep all positives, fill the rest by random sample.
++                pos = np.flatnonzero(labels[:, 1] > 0)
++                need = max_crop_points - pos.size
++                if need <= 0:
++                    keep = np.random.choice(pos, size=max_crop_points, replace=False)
++                else:
++                    neg = np.flatnonzero(labels[:, 1] <= 0)
++                    if neg.size > need:
++                        neg = np.random.choice(neg, size=need, replace=False)
++                    keep = np.concatenate([pos, neg]) if neg.size else pos
++                coordinates = coordinates[keep]
++                color = color[keep]
++                labels = labels[keep]
++                segments = segments[keep]
++                normals = normals[keep]
++                points = points[keep]
++
++        if (
++            "train" in self.mode
++            and self.curriculum_mask_expand
++            and self.add_instance
++        ):
++            radius = curriculum_mask_radius(
++                self.current_epoch,
++                r0=self.curriculum_r0,
++                decay=self.curriculum_decay,
++                alpha=self.curriculum_alpha,
++            )
++            labels = expand_instance_masks_ball(
++                coordinates,
++                labels,
++                radius,
++                ignore_label=self.ignore_label,
++            )
++
+         raw_coordinates = coordinates.copy()
+         raw_color = color
+         raw_normals = normals
+@@ -428,25 +659,22 @@ class SemanticSegmentationDataset(Dataset):
+         if not self.add_colors:
+             color = np.ones((len(color), 3))
+ 
++        # SceneFun3D laser scans sit at large world coords (z~200–400m).
++        # Always center so train crops and full-scene val share the same range.
++        # CRITICAL: np.float32.mean on multi-million-point scans is catastrophically
++        # wrong (z error of meters to tens of meters) because the accumulator
++        # loses precision around |z|~200. Use float64 for the mean, then cast back.
++        if self.dataset_name == "scenefun3d":
++            shift = np.mean(coordinates, axis=0, dtype=np.float64).astype(
++                np.float32
++            )
++            coordinates = coordinates - shift
++            raw_coordinates = coordinates.copy()
++
+         # volume and image augmentations for train
+         if "train" in self.mode or self.is_tta:
+-            if self.cropping:
+-                new_idx = self.random_cuboid(
+-                    coordinates,
+-                    labels[:, 1],
+-                    self._remap_from_zero(labels[:, 0].copy()),
+-                )
+-
+-                coordinates = coordinates[new_idx]
+-                color = color[new_idx]
+-                labels = labels[new_idx]
+-                segments = segments[new_idx]
+-                raw_color = raw_color[new_idx]
+-                raw_normals = raw_normals[new_idx]
+-                normals = normals[new_idx]
+-                points = points[new_idx]
+-
+-            coordinates -= coordinates.mean(0)
++            if self.dataset_name != "scenefun3d":
++                coordinates -= coordinates.mean(0)
+ 
+             try:
+                 coordinates += (
+@@ -667,6 +895,23 @@ class SemanticSegmentationDataset(Dataset):
+                 raw_coordinates,
+                 idx,
+             )
++        if self.dataset_name == "scenefun3d":
++            if self.data[idx].get("scene_name"):
++                scene_name = str(self.data[idx]["scene_name"])
++            else:
++                visit = str(self.data[idx].get("visit", self.data[idx]["scene"]))
++                sub_scene = int(self.data[idx].get("sub_scene", 0))
++                scene_name = f"scene{visit}_{sub_scene:02d}"
++            return (
++                coordinates,
++                features,
++                labels,
++                scene_name,
++                raw_color,
++                raw_normals,
++                raw_coordinates,
++                idx,
++            )
+         else:
+             return (
+                 coordinates,
+diff --git a/datasets/utils.py b/datasets/utils.py
+index 46d8dd7..c601394 100644
+--- a/datasets/utils.py
++++ b/datasets/utils.py
+@@ -482,8 +482,18 @@ def get_instance_masks(
+                 ] = True
+                 segment_masks.append(segment_mask)
+ 
++        n_pts = list_labels[batch_id].shape[0]
+         if len(label_ids) == 0:
+-            return list()
++            # Keep batch alignment under DDP: never collapse the whole batch to [].
++            empty = {
++                "labels": torch.zeros((0,), dtype=torch.long),
++                "masks": torch.zeros((0, n_pts), dtype=torch.bool),
++            }
++            if list_segments:
++                n_seg = list_segments[batch_id].shape[0]
++                empty["segment_mask"] = torch.zeros((0, n_seg), dtype=torch.bool)
++            target.append(empty)
++            continue
+ 
+         label_ids = torch.stack(label_ids)
+         masks = torch.stack(masks)
+diff --git a/main_instance_segmentation.py b/main_instance_segmentation.py
+index dc117a0..822ba66 100644
+--- a/main_instance_segmentation.py
++++ b/main_instance_segmentation.py
+@@ -38,10 +38,30 @@ def get_parameters(cfg: DictConfig):
+     if not os.path.exists(cfg.general.save_dir):
+         os.makedirs(cfg.general.save_dir)
+     else:
+-        print("EXPERIMENT ALREADY EXIST")
+-        cfg["trainer"][
+-            "resume_from_checkpoint"
+-        ] = f"{cfg.general.save_dir}/last-epoch.ckpt"
++        # Prefer last-epoch.ckpt, but fall back if it was truncated mid-write.
++        candidates = [
++            f"{cfg.general.save_dir}/last-epoch.ckpt",
++            f"{cfg.general.save_dir}/last.ckpt",
++        ]
++        resume_ckpt = None
++        for cand in candidates:
++            if not os.path.isfile(cand):
++                continue
++            try:
++                import torch
++
++                torch.load(cand, map_location="cpu")
++                resume_ckpt = cand
++                break
++            except Exception as e:
++                print(f"Skipping corrupt checkpoint {cand}: {type(e).__name__}: {e}")
++        if resume_ckpt is not None:
++            print(f"EXPERIMENT ALREADY EXIST — resuming from {resume_ckpt}")
++            cfg["trainer"]["resume_from_checkpoint"] = resume_ckpt
++        else:
++            print(
++                "EXPERIMENT DIR EXISTS — no usable checkpoint, training from scratch"
++            )
+ 
+     for log in cfg.logging:
+         print(log)
+@@ -74,12 +94,20 @@ def train(cfg: DictConfig):
+ 
+     callbacks.append(RegularCheckpointing())
+ 
++    trainer_kwargs = OmegaConf.to_container(cfg.trainer, resolve=True)
++    strategy = trainer_kwargs.get("strategy", None)
++    if isinstance(strategy, str) and strategy.startswith("ddp"):
++        # Empty crops / partial graph → unused params; without this DDP deadlocks.
++        from pytorch_lightning.strategies import DDPStrategy
++
++        trainer_kwargs["strategy"] = DDPStrategy(find_unused_parameters=True)
++
+     runner = Trainer(
+         logger=loggers,
+         gpus=cfg.general.gpus,
+         callbacks=callbacks,
+-        weights_save_path=str(cfg.general.save_dir),
+-        **cfg.trainer,
++        default_root_dir=str(cfg.general.save_dir),
++        **trainer_kwargs,
+     )
+     runner.fit(model)
+ 
+@@ -94,7 +122,7 @@ def test(cfg: DictConfig):
+     runner = Trainer(
+         gpus=cfg.general.gpus,
+         logger=loggers,
+-        weights_save_path=str(cfg.general.save_dir),
++        default_root_dir=str(cfg.general.save_dir),
+         **cfg.trainer,
+     )
+     runner.test(model)
+diff --git a/models/criterion.py b/models/criterion.py
+index 4c93625..82d5c92 100644
+--- a/models/criterion.py
++++ b/models/criterion.py
+@@ -181,6 +181,13 @@ class SetCriterion(nn.Module):
+             map = outputs["pred_masks"][batch_id][:, map_id].T
+             target_mask = targets[batch_id][mask_type][target_id]
+ 
++            if target_mask.numel() == 0 or map.numel() == 0:
++                # No matched instances: keep graph tied to predictions for DDP.
++                z = outputs["pred_masks"][batch_id].sum() * 0.0
++                loss_masks.append(z)
++                loss_dices.append(z)
++                continue
++
+             if self.num_points != -1:
+                 point_idx = torch.randperm(
+                     target_mask.shape[1], device=target_mask.device
+@@ -198,6 +205,9 @@ class SetCriterion(nn.Module):
+             loss_masks.append(sigmoid_ce_loss_jit(map, target_mask, num_masks))
+             loss_dices.append(dice_loss_jit(map, target_mask, num_masks))
+         # del target_mask
++        if len(loss_masks) == 0:
++            z = outputs["pred_masks"][0].sum() * 0.0
++            return {"loss_mask": z, "loss_dice": z}
+         return {
+             "loss_mask": torch.sum(torch.stack(loss_masks)),
+             "loss_dice": torch.sum(torch.stack(loss_dices)),
+diff --git a/models/matcher.py b/models/matcher.py
+index fc0e7a0..4feb97e 100644
+--- a/models/matcher.py
++++ b/models/matcher.py
+@@ -3,6 +3,7 @@
+ """
+ Modules to compute the matching cost and solve the corresponding LSAP.
+ """
++import numpy as np
+ import torch
+ import torch.nn.functional as F
+ from scipy.optimize import linear_sum_assignment
+@@ -115,6 +116,16 @@ class HungarianMatcher(nn.Module):
+             )  # [num_queries, num_classes]
+             tgt_ids = targets[b]["labels"].clone()
+ 
++            # Empty GT (no instances in crop): no matching; criterion treats all as no-object.
++            if tgt_ids.numel() == 0:
++                indices.append(
++                    (
++                        np.array([], dtype=np.int64),
++                        np.array([], dtype=np.int64),
++                    )
++                )
++                continue
++
+             # Compute the classification cost. Contrary to the loss, we don't use the NLL,
+             # but approximate it in 1 - proba[target class].
+             # The 1 is a constant that doesn't change the matching, it can be ommitted.
+diff --git a/trainer/trainer.py b/trainer/trainer.py
+index b794e38..e396b07 100644
+--- a/trainer/trainer.py
++++ b/trainer/trainer.py
+@@ -1,6 +1,7 @@
+ import gc
+ from contextlib import nullcontext
+ from pathlib import Path
++import pickle
+ import statistics
+ import shutil
+ import os
+@@ -52,9 +53,22 @@ class RegularCheckpointing(pl.Callback):
+     def on_train_epoch_end(
+         self, trainer: "pl.Trainer", pl_module: "pl.LightningModule"
+     ):
++        # DDP: only rank0 may touch the shared checkpoint path.
++        if getattr(trainer, "is_global_zero", True) is False:
++            return
+         general = pl_module.config.general
+-        trainer.save_checkpoint(f"{general.save_dir}/last-epoch.ckpt")
+-        print("Checkpoint created")
++        # Atomic replace: a kill mid-write used to leave a truncated zip that
++        # then breaks auto-resume from last-epoch.ckpt.
++        final = f"{general.save_dir}/last-epoch.ckpt"
++        tmp = f"{final}.tmp"
++        try:
++            os.makedirs(general.save_dir, exist_ok=True)
++            trainer.save_checkpoint(tmp)
++            os.replace(tmp, final)
++            print("Checkpoint created")
++        except FileNotFoundError as e:
++            # Race if an external cleanup deleted save_dir mid-epoch.
++            print(f"Checkpoint skipped (save_dir race): {e}")
+ 
+ 
+ class InstanceSegmentation(pl.LightningModule):
+@@ -125,6 +139,35 @@ class InstanceSegmentation(pl.LightningModule):
+             )
+         return x
+ 
++    def _empty_instance_target(self, n_points, device):
++        """Dummy target with zero instances so forward/criterion/log stay aligned in DDP."""
++        t = {
++            "labels": torch.zeros((0,), dtype=torch.long, device=device),
++            "masks": torch.zeros((0, n_points), dtype=torch.bool, device=device),
++            "point2segment": torch.zeros(
++                n_points, dtype=torch.long, device=device
++            ),
++        }
++        if self.mask_type == "segment_mask":
++            t["segment_mask"] = torch.zeros(
++                (0, max(n_points, 1)), dtype=torch.bool, device=device
++            )
++        return t
++
++    def _log_train_losses(self, losses):
++        logs = {
++            f"train_{k}": v.detach().cpu().item() for k, v in losses.items()
++        }
++        ce = [v for k, v in logs.items() if "loss_ce" in k]
++        mk = [v for k, v in logs.items() if "loss_mask" in k]
++        dice = [v for k, v in logs.items() if "loss_dice" in k]
++        logs["train_mean_loss_ce"] = statistics.mean(ce) if ce else 0.0
++        logs["train_mean_loss_mask"] = statistics.mean(mk) if mk else 0.0
++        logs["train_mean_loss_dice"] = statistics.mean(dice) if dice else 0.0
++        # Always log on every rank (sync_dist) so DDP collectives match.
++        self.log_dict(logs, sync_dist=True)
++        return logs
++
+     def training_step(self, batch, batch_idx):
+         data, target, file_names = batch
+ 
+@@ -132,10 +175,6 @@ class InstanceSegmentation(pl.LightningModule):
+             print("data exceeds threshold")
+             raise RuntimeError("BATCH TOO BIG")
+ 
+-        if len(target) == 0:
+-            print("no targets")
+-            return None
+-
+         raw_coordinates = None
+         if self.config.data.add_raw_coordinates:
+             raw_coordinates = data.features[:, -3:]
+@@ -147,6 +186,32 @@ class InstanceSegmentation(pl.LightningModule):
+             device=self.device,
+         )
+ 
++        # Guarantee len(target)==batch_size with usable keys (never early-return).
++        if len(target) == 0:
++            print("no targets — synthesizing empty-instance dummy target")
++            target = [
++                self._empty_instance_target(data.features.shape[0], self.device)
++            ]
++        else:
++            for i in range(len(target)):
++                if "point2segment" not in target[i]:
++                    target[i]["point2segment"] = torch.zeros(
++                        data.features.shape[0],
++                        dtype=torch.long,
++                        device=self.device,
++                    )
++                if target[i]["labels"].numel() == 0:
++                    # Ensure mask tensors exist for matcher/criterion.
++                    n = data.features.shape[0]
++                    target[i]["masks"] = target[i].get(
++                        "masks",
++                        torch.zeros((0, n), dtype=torch.bool, device=self.device),
++                    )
++                    if self.mask_type == "segment_mask" and "segment_mask" not in target[i]:
++                        target[i]["segment_mask"] = torch.zeros(
++                            (0, max(n, 1)), dtype=torch.bool, device=self.device
++                        )
++
+         try:
+             output = self.forward(
+                 data,
+@@ -161,7 +226,15 @@ class InstanceSegmentation(pl.LightningModule):
+                 "only a single point gives nans in cross-attention"
+                 == run_err.args[0]
+             ):
+-                return None
++                # Still take the full log path so DDP ranks stay aligned.
++                zero = data.features.sum() * 0.0
++                losses = {
++                    "loss_ce": zero,
++                    "loss_mask": zero,
++                    "loss_dice": zero,
++                }
++                self._log_train_losses(losses)
++                return zero
+             else:
+                 raise run_err
+ 
+@@ -184,23 +257,7 @@ class InstanceSegmentation(pl.LightningModule):
+                 # remove this loss if not specified in `weight_dict`
+                 losses.pop(k)
+ 
+-        logs = {
+-            f"train_{k}": v.detach().cpu().item() for k, v in losses.items()
+-        }
+-
+-        logs["train_mean_loss_ce"] = statistics.mean(
+-            [item for item in [v for k, v in logs.items() if "loss_ce" in k]]
+-        )
+-
+-        logs["train_mean_loss_mask"] = statistics.mean(
+-            [item for item in [v for k, v in logs.items() if "loss_mask" in k]]
+-        )
+-
+-        logs["train_mean_loss_dice"] = statistics.mean(
+-            [item for item in [v for k, v in logs.items() if "loss_dice" in k]]
+-        )
+-
+-        self.log_dict(logs)
++        self._log_train_losses(losses)
+         return sum(losses.values())
+ 
+     def validation_step(self, batch, batch_idx):
+@@ -599,7 +656,10 @@ class InstanceSegmentation(pl.LightningModule):
+         topk_indices = topk_indices // num_classes
+         mask_pred = mask_pred[:, topk_indices]
+ 
+-        result_pred_mask = (mask_pred > 0).float()
++        mask_logit_thr = float(
++            getattr(self.config.general, "mask_logit_threshold", 0.0)
++        )
++        result_pred_mask = (mask_pred > mask_logit_thr).float()
+         heatmap = mask_pred.float().sigmoid()
+ 
+         mask_scores_per_image = (heatmap * result_pred_mask).sum(0) / (
+@@ -894,7 +954,9 @@ class InstanceSegmentation(pl.LightningModule):
+ 
+             if self.config.general.eval_inner_core == -1:
+                 self.preds[file_names[bid]] = {
+-                    "pred_masks": all_pred_masks[bid],
++                    # bool: SceneFun3D full scans are ~2–12M pts; float32×100
++                    # queries ×30 scenes OOMs the host during DDP gather.
++                    "pred_masks": all_pred_masks[bid].astype(bool, copy=False),
+                     "pred_scores": all_pred_scores[bid],
+                     "pred_classes": all_pred_classes[bid],
+                 }
+@@ -903,7 +965,7 @@ class InstanceSegmentation(pl.LightningModule):
+                 self.preds[file_names[bid]] = {
+                     "pred_masks": all_pred_masks[bid][
+                         self.test_dataset.data[idx[bid]]["cond_inner"]
+-                    ],
++                    ].astype(bool, copy=False),
+                     "pred_scores": all_pred_scores[bid],
+                     "pred_classes": all_pred_classes[bid],
+                 }
+@@ -985,101 +1047,392 @@ class InstanceSegmentation(pl.LightningModule):
+                         self.decoder_id,
+                     )
+ 
+-    def eval_instance_epoch_end(self):
+-        log_prefix = f"val"
+-        ap_results = {}
+-
+-        head_results, tail_results, common_results = [], [], []
++    def _gather_instance_preds_ddp(self, base_path: str):
++        """Merge per-rank val shards so AP is computed on the full val set.
++
++        Under DDP each rank only sees ~N/world_size scenes. Evaluating each
++        shard independently (and racing on the same eval_output dir) both
++        under-reports AP and crashes via rmtree FileNotFoundError.
++        """
++        os.makedirs(base_path, exist_ok=True)
++        rank = int(getattr(self, "global_rank", 0) or 0)
++        world = 1
++        if torch.distributed.is_available() and torch.distributed.is_initialized():
++            world = torch.distributed.get_world_size()
++
++        shard_path = os.path.join(base_path, f"preds_rank{rank}.pkl")
++        with open(shard_path, "wb") as f:
++            pickle.dump(
++                {
++                    "preds": self.preds,
++                    "bbox_preds": self.bbox_preds,
++                    "bbox_gt": self.bbox_gt,
++                },
++                f,
++                protocol=pickle.HIGHEST_PROTOCOL,
++            )
+ 
+-        box_ap_50 = eval_det(
+-            self.bbox_preds, self.bbox_gt, ovthresh=0.5, use_07_metric=False
+-        )
+-        box_ap_25 = eval_det(
+-            self.bbox_preds, self.bbox_gt, ovthresh=0.25, use_07_metric=False
+-        )
+-        mean_box_ap_25 = sum([v for k, v in box_ap_25[-1].items()]) / len(
+-            box_ap_25[-1].keys()
++        if world > 1:
++            torch.distributed.barrier()
++
++        if not self.trainer.is_global_zero:
++            return False
++
++        merged_preds, merged_bbox_preds, merged_bbox_gt = {}, {}, {}
++        for r in range(world):
++            path_r = os.path.join(base_path, f"preds_rank{r}.pkl")
++            with open(path_r, "rb") as f:
++                shard = pickle.load(f)
++            merged_preds.update(shard["preds"])
++            merged_bbox_preds.update(shard["bbox_preds"])
++            merged_bbox_gt.update(shard["bbox_gt"])
++
++        self.preds = merged_preds
++        self.bbox_preds = merged_bbox_preds
++        self.bbox_gt = merged_bbox_gt
++        print(
++            f"[eval] rank0 merged {len(self.preds)} scans from {world} ranks"
+         )
+-        mean_box_ap_50 = sum([v for k, v in box_ap_50[-1].items()]) / len(
+-            box_ap_50[-1].keys()
++        return True
++
++    @staticmethod
++    def _nanmean_values(values):
++        vals = [float(v) for v in values if v is not None and not math.isnan(float(v))]
++        if not vals:
++            return 0.0
++        return float(sum(vals) / len(vals))
++
++    @staticmethod
++    def _mask_iou_indices(a: np.ndarray, b: np.ndarray) -> float:
++        """IoU of two sorted unique index arrays (avoids full-scene bool AND)."""
++        if a.size == 0 or b.size == 0:
++            return 0.0
++        inter = np.intersect1d(a, b, assume_unique=True).size
++        if inter == 0:
++            return 0.0
++        return float(inter) / float(a.size + b.size - inter)
++
++    def _nms_instance_masks(
++        self,
++        index_masks,
++        scores,
++        classes,
++        n_full: int,
++        iou_thr: float = 0.3,
++        max_keep: int = 100,
++    ):
++        """Class-wise greedy NMS on sparse index masks → dense (N,K) bool."""
++        keep_idx, keep_s, keep_c = [], [], []
++        by_c = defaultdict(list)
++        for i, c in enumerate(classes):
++            by_c[int(c)].append(i)
++        for c, idxs in by_c.items():
++            order = sorted(idxs, key=lambda i: scores[i], reverse=True)
++            suppressed = set()
++            kept_c = 0
++            for i in order:
++                if i in suppressed:
++                    continue
++                keep_idx.append(index_masks[i])
++                keep_s.append(scores[i])
++                keep_c.append(c)
++                kept_c += 1
++                if kept_c >= max_keep:
++                    break
++                ai = index_masks[i]
++                for j in order:
++                    if j == i or j in suppressed:
++                        continue
++                    if self._mask_iou_indices(ai, index_masks[j]) >= iou_thr:
++                        suppressed.add(j)
++        if not keep_idx:
++            return (
++                np.zeros((n_full, 0), dtype=bool),
++                np.zeros((0,), dtype=np.float32),
++                np.zeros((0,), dtype=np.int64),
++            )
++        out = np.zeros((n_full, len(keep_idx)), dtype=bool)
++        for k, idxs in enumerate(keep_idx):
++            out[idxs, k] = True
++        return (
++            out,
++            np.asarray(keep_s, dtype=np.float32),
++            np.asarray(keep_c, dtype=np.int64),
+         )
+ 
+-        ap_results[f"{log_prefix}_mean_box_ap_25"] = mean_box_ap_25
+-        ap_results[f"{log_prefix}_mean_box_ap_50"] = mean_box_ap_50
++    def _merge_scenefun3d_sliding_preds(self, preds: dict, iou_thr: float = 0.3):
++        """Map crop preds → full-scene masks + class-wise NMS.
++
++        Crop keys look like ``scene421254_00_c012``. Full-scene GT keys are
++        ``scene421254_00``. Requires validation_dataset.sliding_window data
++        items with ``scene_name``, ``crop_xyxy`` / ``keep_indices_filepath``.
++        """
++        ds = self.validation_dataset
++        meta_by_name = {}
++        for item in ds.data:
++            name = item.get("scene_name")
++            if name:
++                meta_by_name[str(name)] = item
++
++        by_scene = defaultdict(list)
++        for key, pred in preds.items():
++            # scene{visit}_{ss:02d}_c{cid:03d}
++            if "_c" not in key:
++                by_scene[key].append((key, pred, None))
++                continue
++            base, _, cid = key.rpartition("_c")
++            if not cid.isdigit():
++                by_scene[key].append((key, pred, None))
++                continue
++            by_scene[base].append((key, pred, meta_by_name.get(key)))
++
++        merged = {}
++        for scene_name, items in by_scene.items():
++            # Determine full length
++            n_full = None
++            for key, pred, meta in items:
++                if meta is None:
++                    continue
++                if meta.get("keep_indices_filepath"):
++                    # file_len on crop item is post-subsample; need full npy len
++                    pts = np.load(
++                        meta["filepath"].replace("../../", ""), mmap_mode="r"
++                    )
++                    n_full = int(pts.shape[0])
++                    break
++                if meta.get("crop_xyxy") is not None:
++                    pts = np.load(
++                        meta["filepath"].replace("../../", ""), mmap_mode="r"
++                    )
++                    n_full = int(pts.shape[0])
++                    break
++            if n_full is None:
++                # Already full-scene style
++                if len(items) == 1:
++                    merged[scene_name] = items[0][1]
++                continue
++
++            idx_l, scores_l, classes_l = [], [], []
++            for key, pred, meta in items:
++                pm = pred["pred_masks"]
++                if pm is None or (hasattr(pm, "size") and pm.size == 0):
++                    continue
++                if meta is None:
++                    continue
++                keep_path = meta.get("keep_indices_filepath")
++                if keep_path:
++                    full_idx = np.load(keep_path)
++                else:
++                    x0, y0, x1, y1 = meta["crop_xyxy"]
++                    pts = np.load(
++                        meta["filepath"].replace("../../", ""), mmap_mode="r"
++                    )
++                    full_idx = np.flatnonzero(
++                        (pts[:, 0] >= x0)
++                        & (pts[:, 0] < x1)
++                        & (pts[:, 1] >= y0)
++                        & (pts[:, 1] < y1)
++                    )
++                if len(full_idx) != pm.shape[0]:
++                    print(
++                        f"[merge] skip {key}: mask {pm.shape[0]} vs idx {len(full_idx)}"
++                    )
++                    continue
++                # Keep top-20 queries per crop by score before global NMS.
++                order_k = np.argsort(-pred["pred_scores"])[:20]
++                for k in order_k:
++                    m_crop = pm[:, int(k)].astype(bool)
++                    if int(m_crop.sum()) < 10:
++                        continue
++                    abs_idx = np.unique(full_idx[m_crop].astype(np.int64))
++                    idx_l.append(abs_idx)
++                    scores_l.append(float(pred["pred_scores"][int(k)]))
++                    classes_l.append(int(pred["pred_classes"][int(k)]))
++
++            out_m, out_s, out_c = self._nms_instance_masks(
++                idx_l,
++                scores_l,
++                classes_l,
++                n_full=n_full,
++                iou_thr=iou_thr,
++                max_keep=100,
++            )
++            merged[scene_name] = {
++                "pred_masks": out_m,
++                "pred_scores": out_s,
++                "pred_classes": out_c,
++            }
++            print(
++                f"[merge] {scene_name}: crops={len(items)} raw={len(idx_l)} "
++                f"nms={out_m.shape[1] if out_m.size else 0}"
++            )
++        return merged
+ 
+-        for class_id in box_ap_50[-1].keys():
+-            class_name = self.train_dataset.label_info[class_id]["name"]
+-            ap_results[f"{log_prefix}_{class_name}_val_box_ap_50"] = box_ap_50[
+-                -1
+-            ][class_id]
++    def eval_instance_epoch_end(self):
++        log_prefix = f"val"
++        ap_results = {}
+ 
+-        for class_id in box_ap_25[-1].keys():
+-            class_name = self.train_dataset.label_info[class_id]["name"]
+-            ap_results[f"{log_prefix}_{class_name}_val_box_ap_25"] = box_ap_25[
+-                -1
+-            ][class_id]
++        head_results, tail_results, common_results = [], [], []
+ 
+         root_path = f"eval_output"
+-        base_path = f"{root_path}/instance_evaluation_{self.config.general.experiment_name}_{self.current_epoch}"
+-
+-        if self.validation_dataset.dataset_name in [
+-            "scannet",
+-            "stpls3d",
+-            "scannet200",
+-        ]:
+-            gt_data_path = f"{self.validation_dataset.data_dir[0]}/instance_gt/{self.validation_dataset.mode}"
+-        else:
+-            gt_data_path = f"{self.validation_dataset.data_dir[0]}/instance_gt/Area_{self.config.general.area}"
++        base_path = (
++            f"{root_path}/instance_evaluation_"
++            f"{self.config.general.experiment_name}_{self.current_epoch}"
++        )
++        world = 1
++        if torch.distributed.is_available() and torch.distributed.is_initialized():
++            world = torch.distributed.get_world_size()
+ 
+-        pred_path = f"{base_path}/tmp_output.txt"
++        # Gather shards → only rank0 evaluates; ALL ranks must log the same
++        # metrics (ModelCheckpoint monitors val_mean_ap_50 on every rank).
++        is_eval_rank = self._gather_instance_preds_ddp(base_path)
++        ap_path = os.path.join(base_path, "ap_results.pkl")
+ 
+-        log_prefix = f"val"
++        if is_eval_rank:
++            try:
++                if len(self.bbox_preds) > 0 and len(self.bbox_gt) > 0:
++                    box_ap_50 = eval_det(
++                        self.bbox_preds,
++                        self.bbox_gt,
++                        ovthresh=0.5,
++                        use_07_metric=False,
++                    )
++                    box_ap_25 = eval_det(
++                        self.bbox_preds,
++                        self.bbox_gt,
++                        ovthresh=0.25,
++                        use_07_metric=False,
++                    )
++                    if box_ap_25[-1] and box_ap_50[-1]:
++                        mean_box_ap_25 = sum(box_ap_25[-1].values()) / len(
++                            box_ap_25[-1]
++                        )
++                        mean_box_ap_50 = sum(box_ap_50[-1].values()) / len(
++                            box_ap_50[-1]
++                        )
++                        ap_results[f"{log_prefix}_mean_box_ap_25"] = mean_box_ap_25
++                        ap_results[f"{log_prefix}_mean_box_ap_50"] = mean_box_ap_50
+ 
+-        if not os.path.exists(base_path):
+-            os.makedirs(base_path)
++                        for class_id in box_ap_50[-1].keys():
++                            class_name = self.train_dataset.label_info[class_id][
++                                "name"
++                            ]
++                            ap_results[
++                                f"{log_prefix}_{class_name}_val_box_ap_50"
++                            ] = box_ap_50[-1][class_id]
+ 
+-        try:
+-            if self.validation_dataset.dataset_name == "s3dis":
+-                new_preds = {}
+-                for key in self.preds.keys():
+-                    new_preds[
+-                        key.replace(f"Area_{self.config.general.area}_", "")
+-                    ] = {
+-                        "pred_classes": self.preds[key]["pred_classes"] + 1,
+-                        "pred_masks": self.preds[key]["pred_masks"],
+-                        "pred_scores": self.preds[key]["pred_scores"],
+-                    }
+-                mprec, mrec = evaluate(
+-                    new_preds, gt_data_path, pred_path, dataset="s3dis"
+-                )
+-                ap_results[f"{log_prefix}_mean_precision"] = mprec
+-                ap_results[f"{log_prefix}_mean_recall"] = mrec
+-            elif self.validation_dataset.dataset_name == "stpls3d":
+-                new_preds = {}
+-                for key in self.preds.keys():
+-                    new_preds[key.replace(".txt", "")] = {
+-                        "pred_classes": self.preds[key]["pred_classes"],
+-                        "pred_masks": self.preds[key]["pred_masks"],
+-                        "pred_scores": self.preds[key]["pred_scores"],
+-                    }
++                        for class_id in box_ap_25[-1].keys():
++                            class_name = self.train_dataset.label_info[class_id][
++                                "name"
++                            ]
++                            ap_results[
++                                f"{log_prefix}_{class_name}_val_box_ap_25"
++                            ] = box_ap_25[-1][class_id]
++
++                if self.validation_dataset.dataset_name in [
++                    "scannet",
++                    "stpls3d",
++                    "scannet200",
++                    "scenefun3d",
++                ]:
++                    gt_data_path = (
++                        f"{self.validation_dataset.data_dir[0]}/instance_gt/"
++                        f"{self.validation_dataset.mode}"
++                    )
++                else:
++                    gt_data_path = (
++                        f"{self.validation_dataset.data_dir[0]}/instance_gt/"
++                        f"Area_{self.config.general.area}"
++                    )
+ 
+-                evaluate(new_preds, gt_data_path, pred_path, dataset="stpls3d")
+-            else:
+-                evaluate(
+-                    self.preds,
+-                    gt_data_path,
+-                    pred_path,
+-                    dataset=self.validation_dataset.dataset_name,
+-                )
+-            with open(pred_path, "r") as fin:
+-                for line_id, line in enumerate(fin):
+-                    if line_id == 0:
+-                        # ignore header
+-                        continue
+-                    class_name, _, ap, ap_50, ap_25 = line.strip().split(",")
++                pred_path = f"{base_path}/tmp_output.txt"
++
++                # Sliding-window crops → full-scene merge so AP matches paper
++                # full-scan GT (crop-level AP was ~7× inflated vs full-scene).
++                if (
++                    self.validation_dataset.dataset_name == "scenefun3d"
++                    and getattr(self.validation_dataset, "sliding_window", False)
++                ):
++                    n_before = len(self.preds)
++                    self.preds = self._merge_scenefun3d_sliding_preds(self.preds)
++                    print(
++                        f"[eval] merged sliding crops {n_before} → "
++                        f"{len(self.preds)} full scenes"
++                    )
+ 
+-                    if self.validation_dataset.dataset_name == "scannet200":
+-                        if class_name in VALID_CLASS_IDS_200_VALIDATION:
++                if self.validation_dataset.dataset_name == "s3dis":
++                    new_preds = {}
++                    for key in self.preds.keys():
++                        new_preds[
++                            key.replace(f"Area_{self.config.general.area}_", "")
++                        ] = {
++                            "pred_classes": self.preds[key]["pred_classes"] + 1,
++                            "pred_masks": self.preds[key]["pred_masks"],
++                            "pred_scores": self.preds[key]["pred_scores"],
++                        }
++                    mprec, mrec = evaluate(
++                        new_preds, gt_data_path, pred_path, dataset="s3dis"
++                    )
++                    ap_results[f"{log_prefix}_mean_precision"] = mprec
++                    ap_results[f"{log_prefix}_mean_recall"] = mrec
++                elif self.validation_dataset.dataset_name == "stpls3d":
++                    new_preds = {}
++                    for key in self.preds.keys():
++                        new_preds[key.replace(".txt", "")] = {
++                            "pred_classes": self.preds[key]["pred_classes"],
++                            "pred_masks": self.preds[key]["pred_masks"],
++                            "pred_scores": self.preds[key]["pred_scores"],
++                        }
++
++                    evaluate(
++                        new_preds, gt_data_path, pred_path, dataset="stpls3d"
++                    )
++                else:
++                    evaluate(
++                        self.preds,
++                        gt_data_path,
++                        pred_path,
++                        dataset=self.validation_dataset.dataset_name,
++                    )
++                with open(pred_path, "r") as fin:
++                    for line_id, line in enumerate(fin):
++                        if line_id == 0:
++                            continue
++                        class_name, _, ap, ap_50, ap_25 = line.strip().split(",")
++
++                        if self.validation_dataset.dataset_name == "scannet200":
++                            if class_name in VALID_CLASS_IDS_200_VALIDATION:
++                                ap_results[
++                                    f"{log_prefix}_{class_name}_val_ap"
++                                ] = float(ap)
++                                ap_results[
++                                    f"{log_prefix}_{class_name}_val_ap_50"
++                                ] = float(ap_50)
++                                ap_results[
++                                    f"{log_prefix}_{class_name}_val_ap_25"
++                                ] = float(ap_25)
++
++                                if class_name in HEAD_CATS_SCANNET_200:
++                                    head_results.append(
++                                        np.array(
++                                            (float(ap), float(ap_50), float(ap_25))
++                                        )
++                                    )
++                                elif class_name in COMMON_CATS_SCANNET_200:
++                                    common_results.append(
++                                        np.array(
++                                            (float(ap), float(ap_50), float(ap_25))
++                                        )
++                                    )
++                                elif class_name in TAIL_CATS_SCANNET_200:
++                                    tail_results.append(
++                                        np.array(
++                                            (float(ap), float(ap_50), float(ap_25))
++                                        )
++                                    )
++                                else:
++                                    assert (False, "class not known!")
++                        else:
+                             ap_results[
+                                 f"{log_prefix}_{class_name}_val_ap"
+                             ] = float(ap)
+@@ -1090,140 +1443,130 @@ class InstanceSegmentation(pl.LightningModule):
+                                 f"{log_prefix}_{class_name}_val_ap_25"
+                             ] = float(ap_25)
+ 
+-                            if class_name in HEAD_CATS_SCANNET_200:
+-                                head_results.append(
+-                                    np.array(
+-                                        (float(ap), float(ap_50), float(ap_25))
+-                                    )
+-                                )
+-                            elif class_name in COMMON_CATS_SCANNET_200:
+-                                common_results.append(
+-                                    np.array(
+-                                        (float(ap), float(ap_50), float(ap_25))
+-                                    )
+-                                )
+-                            elif class_name in TAIL_CATS_SCANNET_200:
+-                                tail_results.append(
+-                                    np.array(
+-                                        (float(ap), float(ap_50), float(ap_25))
+-                                    )
+-                                )
+-                            else:
+-                                assert (False, "class not known!")
+-                    else:
+-                        ap_results[
+-                            f"{log_prefix}_{class_name}_val_ap"
+-                        ] = float(ap)
+-                        ap_results[
+-                            f"{log_prefix}_{class_name}_val_ap_50"
+-                        ] = float(ap_50)
+-                        ap_results[
+-                            f"{log_prefix}_{class_name}_val_ap_25"
+-                        ] = float(ap_25)
+-
+-            if self.validation_dataset.dataset_name == "scannet200":
+-                head_results = np.stack(head_results)
+-                common_results = np.stack(common_results)
+-                tail_results = np.stack(tail_results)
+-
+-                mean_tail_results = np.nanmean(tail_results, axis=0)
+-                mean_common_results = np.nanmean(common_results, axis=0)
+-                mean_head_results = np.nanmean(head_results, axis=0)
+-
+-                ap_results[
+-                    f"{log_prefix}_mean_tail_ap_25"
+-                ] = mean_tail_results[0]
+-                ap_results[
+-                    f"{log_prefix}_mean_common_ap_25"
+-                ] = mean_common_results[0]
+-                ap_results[
+-                    f"{log_prefix}_mean_head_ap_25"
+-                ] = mean_head_results[0]
+-
+-                ap_results[
+-                    f"{log_prefix}_mean_tail_ap_50"
+-                ] = mean_tail_results[1]
+-                ap_results[
+-                    f"{log_prefix}_mean_common_ap_50"
+-                ] = mean_common_results[1]
+-                ap_results[
+-                    f"{log_prefix}_mean_head_ap_50"
+-                ] = mean_head_results[1]
+-
+-                ap_results[
+-                    f"{log_prefix}_mean_tail_ap_25"
+-                ] = mean_tail_results[2]
+-                ap_results[
+-                    f"{log_prefix}_mean_common_ap_25"
+-                ] = mean_common_results[2]
+-                ap_results[
+-                    f"{log_prefix}_mean_head_ap_25"
+-                ] = mean_head_results[2]
+-
+-                overall_ap_results = np.nanmean(
+-                    np.vstack((head_results, common_results, tail_results)),
+-                    axis=0,
+-                )
++                if self.validation_dataset.dataset_name == "scannet200":
++                    head_results = np.stack(head_results)
++                    common_results = np.stack(common_results)
++                    tail_results = np.stack(tail_results)
++
++                    mean_tail_results = np.nanmean(tail_results, axis=0)
++                    mean_common_results = np.nanmean(common_results, axis=0)
++                    mean_head_results = np.nanmean(head_results, axis=0)
++
++                    ap_results[f"{log_prefix}_mean_tail_ap_25"] = mean_tail_results[0]
++                    ap_results[
++                        f"{log_prefix}_mean_common_ap_25"
++                    ] = mean_common_results[0]
++                    ap_results[f"{log_prefix}_mean_head_ap_25"] = mean_head_results[0]
++
++                    ap_results[f"{log_prefix}_mean_tail_ap_50"] = mean_tail_results[1]
++                    ap_results[
++                        f"{log_prefix}_mean_common_ap_50"
++                    ] = mean_common_results[1]
++                    ap_results[f"{log_prefix}_mean_head_ap_50"] = mean_head_results[1]
++
++                    # Keep original Mask3D indexing quirk for scannet200 splits.
++                    ap_results[f"{log_prefix}_mean_tail_ap_25"] = mean_tail_results[2]
++                    ap_results[
++                        f"{log_prefix}_mean_common_ap_25"
++                    ] = mean_common_results[2]
++                    ap_results[f"{log_prefix}_mean_head_ap_25"] = mean_head_results[2]
++
++                    overall_ap_results = np.nanmean(
++                        np.vstack((head_results, common_results, tail_results)),
++                        axis=0,
++                    )
+ 
+-                ap_results[f"{log_prefix}_mean_ap"] = overall_ap_results[0]
+-                ap_results[f"{log_prefix}_mean_ap_50"] = overall_ap_results[1]
+-                ap_results[f"{log_prefix}_mean_ap_25"] = overall_ap_results[2]
++                    ap_results[f"{log_prefix}_mean_ap"] = overall_ap_results[0]
++                    ap_results[f"{log_prefix}_mean_ap_50"] = overall_ap_results[1]
++                    ap_results[f"{log_prefix}_mean_ap_25"] = overall_ap_results[2]
+ 
+-                ap_results = {
+-                    key: 0.0 if math.isnan(score) else score
+-                    for key, score in ap_results.items()
+-                }
+-            else:
+-                mean_ap = statistics.mean(
+-                    [
+-                        item
+-                        for key, item in ap_results.items()
+-                        if key.endswith("val_ap")
+-                    ]
+-                )
+-                mean_ap_50 = statistics.mean(
+-                    [
+-                        item
+-                        for key, item in ap_results.items()
+-                        if key.endswith("val_ap_50")
+-                    ]
+-                )
+-                mean_ap_25 = statistics.mean(
+-                    [
+-                        item
+-                        for key, item in ap_results.items()
+-                        if key.endswith("val_ap_25")
+-                    ]
+-                )
++                    ap_results = {
++                        key: 0.0 if math.isnan(score) else score
++                        for key, score in ap_results.items()
++                    }
++                else:
++                    mean_ap = self._nanmean_values(
++                        [
++                            item
++                            for key, item in ap_results.items()
++                            if key.endswith("val_ap")
++                        ]
++                    )
++                    mean_ap_50 = self._nanmean_values(
++                        [
++                            item
++                            for key, item in ap_results.items()
++                            if key.endswith("val_ap_50")
++                        ]
++                    )
++                    mean_ap_25 = self._nanmean_values(
++                        [
++                            item
++                            for key, item in ap_results.items()
++                            if key.endswith("val_ap_25")
++                        ]
++                    )
+ 
+-                ap_results[f"{log_prefix}_mean_ap"] = mean_ap
+-                ap_results[f"{log_prefix}_mean_ap_50"] = mean_ap_50
+-                ap_results[f"{log_prefix}_mean_ap_25"] = mean_ap_25
++                    ap_results[f"{log_prefix}_mean_ap"] = mean_ap
++                    ap_results[f"{log_prefix}_mean_ap_50"] = mean_ap_50
++                    ap_results[f"{log_prefix}_mean_ap_25"] = mean_ap_25
+ 
+-                ap_results = {
+-                    key: 0.0 if math.isnan(score) else score
+-                    for key, score in ap_results.items()
+-                }
+-        except (IndexError, OSError) as e:
+-            print("NO SCORES!!!")
+-            ap_results[f"{log_prefix}_mean_ap"] = 0.0
+-            ap_results[f"{log_prefix}_mean_ap_50"] = 0.0
+-            ap_results[f"{log_prefix}_mean_ap_25"] = 0.0
++                    ap_results = {
++                        key: 0.0 if math.isnan(score) else score
++                        for key, score in ap_results.items()
++                    }
++            except (
++                IndexError,
++                OSError,
++                ValueError,
++                ZeroDivisionError,
++                statistics.StatisticsError,
++                KeyError,
++            ) as e:
++                print(f"NO SCORES!!! ({type(e).__name__}: {e})")
++                ap_results[f"{log_prefix}_mean_ap"] = 0.0
++                ap_results[f"{log_prefix}_mean_ap_50"] = 0.0
++                ap_results[f"{log_prefix}_mean_ap_25"] = 0.0
++
++            # Always expose checkpoint monitor keys.
++            for k in (
++                f"{log_prefix}_mean_ap",
++                f"{log_prefix}_mean_ap_50",
++                f"{log_prefix}_mean_ap_25",
++            ):
++                ap_results.setdefault(k, 0.0)
+ 
+-        self.log_dict(ap_results)
++            with open(ap_path, "wb") as f:
++                pickle.dump(ap_results, f, protocol=pickle.HIGHEST_PROTOCOL)
+ 
+-        if not self.config.general.export:
+-            shutil.rmtree(base_path)
++        if world > 1:
++            torch.distributed.barrier()
+ 
+-        del self.preds
+-        del self.bbox_preds
+-        del self.bbox_gt
++        if not is_eval_rank:
++            with open(ap_path, "rb") as f:
++                ap_results = pickle.load(f)
+ 
+-        gc.collect()
++        # Log on every rank so ModelCheckpoint(monitor=val_mean_ap_50) succeeds.
++        self.log_dict(ap_results)
++
++        if world > 1:
++            torch.distributed.barrier()
++
++        if is_eval_rank and not self.config.general.export:
++            try:
++                shutil.rmtree(base_path)
++            except FileNotFoundError:
++                pass
+ 
+         self.preds = dict()
+         self.bbox_preds = dict()
+         self.bbox_gt = dict()
++        gc.collect()
++        if torch.cuda.is_available():
++            torch.cuda.empty_cache()
++
++        if world > 1:
++            torch.distributed.barrier()
+ 
+     def test_epoch_end(self, outputs):
+         if self.config.general.export:
+@@ -1251,6 +1594,7 @@ class InstanceSegmentation(pl.LightningModule):
+         self.log_dict(dd)
+ 
+     def configure_optimizers(self):
++        self._ensure_fit_datasets()
+         optimizer = hydra.utils.instantiate(
+             self.config.optimizer, params=self.parameters()
+         )
+@@ -1266,18 +1610,36 @@ class InstanceSegmentation(pl.LightningModule):
+         return [optimizer], [scheduler_config]
+ 
+     def prepare_data(self):
+-        self.train_dataset = hydra.utils.instantiate(
+-            self.config.data.train_dataset
+-        )
+-        self.validation_dataset = hydra.utils.instantiate(
+-            self.config.data.validation_dataset
+-        )
+-        self.test_dataset = hydra.utils.instantiate(
+-            self.config.data.test_dataset
+-        )
+-        self.labels_info = self.train_dataset.label_info
++        # Rank-0 only in DDP; keep empty. Datasets are built in setup() on every rank.
++        pass
++
++    def _ensure_fit_datasets(self):
++        if not hasattr(self, "train_dataset"):
++            self.train_dataset = hydra.utils.instantiate(
++                self.config.data.train_dataset
++            )
++            self.labels_info = self.train_dataset.label_info
++        if not hasattr(self, "validation_dataset"):
++            self.validation_dataset = hydra.utils.instantiate(
++                self.config.data.validation_dataset
++            )
++
++    def setup(self, stage=None):
++        if stage in (None, "fit"):
++            self._ensure_fit_datasets()
++        if stage in (None, "test"):
++            if not hasattr(self, "test_dataset"):
++                self.test_dataset = hydra.utils.instantiate(
++                    self.config.data.test_dataset
++                )
++
++    def on_train_epoch_start(self):
++        epoch = int(self.current_epoch)
++        if hasattr(self.train_dataset, "current_epoch"):
++            self.train_dataset.current_epoch = epoch
+ 
+     def train_dataloader(self):
++        self._ensure_fit_datasets()
+         c_fn = hydra.utils.instantiate(self.config.data.train_collation)
+         return hydra.utils.instantiate(
+             self.config.data.train_dataloader,
+@@ -1286,6 +1648,7 @@ class InstanceSegmentation(pl.LightningModule):
+         )
+ 
+     def val_dataloader(self):
++        self._ensure_fit_datasets()
+         c_fn = hydra.utils.instantiate(self.config.data.validation_collation)
+         return hydra.utils.instantiate(
+             self.config.data.validation_dataloader,
+
+diff --git a/conf/data/datasets/scenefun3d.yaml b/conf/data/datasets/scenefun3d.yaml
+new file mode 100644
+index 0000000..557585a
+--- /dev/null
++++ b/conf/data/datasets/scenefun3d.yaml
+@@ -0,0 +1,102 @@
++# @package data
++# Drop-in dataset yaml for third_party/Mask3D (copy to conf/data/datasets/).
++# Paths are relative to third_party/Mask3D. The ProFunc3D exporter overrides
++# all three paths explicitly when a different --processed directory is used.
++#
++# Class layout (label_database.yaml):
++#   0 empty (not validation), 1..9 affordance, ignore_label=255
++# Remap: with num_labels=9 → validation-only labels remapped 0..8.
++# IMPORTANT: after remap, targets are already 0..8. Use label_offset=0 and
++# filter_out_classes=[] (NOT ScanNet/STPLS style offset=1 / filter [0], which
++# drops rotate and shifts every class id → AP≈0 at eval).
++
++train_dataset:
++  _target_: datasets.semseg.SemanticSegmentationDataset
++  dataset_name: "scenefun3d"
++  data_dir: ../../outputs/val/mask3d_processed
++  image_augmentations_path: conf/augmentation/albumentations_aug.yaml
++  volume_augmentations_path: conf/augmentation/volumentations_aug.yaml
++  label_db_filepath: ../../outputs/val/mask3d_processed/label_database.yaml
++  color_mean_std: ../../outputs/val/mask3d_processed/color_mean_std.yaml
++  data_percent: 1.0
++  mode: ${data.train_mode}
++  ignore_label: ${data.ignore_label}
++  num_labels: ${data.num_labels}
++  add_raw_coordinates: ${data.add_raw_coordinates}
++  add_colors: ${data.add_colors}
++  add_normals: ${data.add_normals}
++  add_instance: ${data.add_instance}
++  instance_oversampling: 0.0
++  place_around_existing: false
++  point_per_cut: 0
++  max_cut_region: 0
++  flip_in_center: false
++  noise_rate: 0
++  resample_points: 0
++  add_unlabeled_pc: false
++  cropping: ${data.cropping}
++  cropping_args: ${data.cropping_args}
++  is_tta: false
++  crop_min_size: ${data.crop_min_size}
++  crop_length: ${data.crop_length}
++  filter_out_classes: []
++  label_offset: 0
++  database_basename: null
++  curriculum_mask_expand: true
++  curriculum_r0: 0.1
++  curriculum_decay: 0.5
++  curriculum_alpha: 200
++  # Fraction of train crops centered on a GT instance (rest = random cuboid).
++  instance_crop_prob: 0.5
++
++validation_dataset:
++  _target_: datasets.semseg.SemanticSegmentationDataset
++  dataset_name: "scenefun3d"
++  data_dir: ../../outputs/val/mask3d_processed
++  image_augmentations_path: null
++  volume_augmentations_path: null
++  label_db_filepath: ../../outputs/val/mask3d_processed/label_database.yaml
++  color_mean_std: ../../outputs/val/mask3d_processed/color_mean_std.yaml
++  data_percent: 1.0
++  mode: ${data.validation_mode}
++  ignore_label: ${data.ignore_label}
++  num_labels: ${data.num_labels}
++  add_raw_coordinates: ${data.add_raw_coordinates}
++  add_colors: ${data.add_colors}
++  add_normals: ${data.add_normals}
++  add_instance: ${data.add_instance}
++  cropping: false
++  is_tta: false
++  crop_min_size: ${data.crop_min_size}
++  crop_length: ${data.crop_length}
++  # When true, val uses precomputed 4m sliding crops (build_sliding_val_crops.py)
++  # so eval matches train crop scale (closes full-scene blob domain gap).
++  sliding_window: false
++  crop_stride: 2.0
++  filter_out_classes: []
++  label_offset: 0
++
++test_dataset:
++  _target_: datasets.semseg.SemanticSegmentationDataset
++  dataset_name: "scenefun3d"
++  data_dir: ../../outputs/val/mask3d_processed
++  image_augmentations_path: null
++  volume_augmentations_path: null
++  label_db_filepath: ../../outputs/val/mask3d_processed/label_database.yaml
++  color_mean_std: ../../outputs/val/mask3d_processed/color_mean_std.yaml
++  data_percent: 1.0
++  mode: ${data.test_mode}
++  ignore_label: ${data.ignore_label}
++  num_labels: ${data.num_labels}
++  add_raw_coordinates: ${data.add_raw_coordinates}
++  add_colors: ${data.add_colors}
++  add_normals: ${data.add_normals}
++  add_instance: ${data.add_instance}
++  cropping: false
++  is_tta: false
++  crop_min_size: ${data.crop_min_size}
++  crop_length: ${data.crop_length}
++  sliding_window: false
++  crop_stride: 2.0
++  filter_out_classes: []
++  label_offset: 0
+
+diff --git a/conf/data/indoor_scenefun3d.yaml b/conf/data/indoor_scenefun3d.yaml
+new file mode 100644
+index 0000000..36e6094
+--- /dev/null
++++ b/conf/data/indoor_scenefun3d.yaml
+@@ -0,0 +1,38 @@
++# @package _group_
++# Override for SceneFun3D Task-1 (9 affordance classes).
++# Use with: data=indoor_scenefun3d  data/datasets=scenefun3d
++# Copy into third_party/Mask3D/conf/data/
++
++train_mode: train
++validation_mode: validation
++test_mode: validation
++
++ignore_label: 255
++add_raw_coordinates: true
++add_colors: true
++add_normals: false
++in_channels: 3
++num_labels: 9
++add_instance: ${general.add_instance}
++task: ${general.task}
++
++pin_memory: false
++num_workers: 4
++batch_size: 2
++test_batch_size: 1
++cache_data: false
++
++voxel_size: 0.02
++
++reps_per_epoch: ${general.reps_per_epoch}
++
++cropping: false
++cropping_args:
++  min_points: 30000
++  aspect: 0.8
++  min_crop: 0.5
++  max_crop: 1.0
++
++crop_min_size: 20000
++crop_length: 6.0
++cropping_v1: true
+
+diff --git a/conf/matcher/hungarian_matcher_mask3df.yaml b/conf/matcher/hungarian_matcher_mask3df.yaml
+new file mode 100644
+index 0000000..06cbe52
+--- /dev/null
++++ b/conf/matcher/hungarian_matcher_mask3df.yaml
+@@ -0,0 +1,15 @@
++# @package _group_
++# Mask3D-F paper appendix: L = 5 L_dice + 2 L_ce (mask CE).
++# In Mask3D these weights are taken from matcher costs
++# (see trainer/trainer.py weight_dict from matcher.cost_*).
++#
++# Copy to third_party/Mask3D/conf/matcher/ and select via hydra:
++#   matcher=hungarian_matcher_mask3df
++# full_train.sh overrides: v8 cost_mask=0.5 / cost_dice=5 / num_points=-1
++_target_: models.matcher.HungarianMatcher
++cost_class: 2.
++cost_mask: 2.   # paper λ=2; full_train overrides lower to fight empty-mask
++cost_dice: 5.   # Dice λ=5
++# -1 = all voxels (Mask3D default / paper-like). Use a fraction (e.g. 0.125) only if OOM.
++# v5+ full_train.sh overrides to -1 under crop.
++num_points: -1
