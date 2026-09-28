@@ -13,9 +13,6 @@ On the SceneFun3D Task-2 validation set, the released configuration obtains:
 |---:|---:|---:|---:|---:|---:|---:|
 | 23.330 | 31.910 | 43.146 | 28.607 | 36.180 | 44.045 | 25.182 |
 
-The machine-readable reference values are provided in
-[`assets/expected_metrics.json`](assets/expected_metrics.json).
-
 ## Repository layout
 
 ```text
