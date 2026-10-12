@@ -27,6 +27,4 @@ https://github.com/JonasSchult/Mask3D.git
 11bd5ff94477ff7194e9a7c52e9fae54d73ac3b5
 ```
 
-Mask3D retains its upstream MIT license. See `Fun3DU/NOTICE.md` for Fun3DU
-provenance and the redistribution caveat that must be resolved before making
-the repository public.
+Mask3D retains its upstream MIT license. 
